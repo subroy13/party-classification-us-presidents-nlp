@@ -1,0 +1,821 @@
+---
+title: "Text Classification in R"
+author: ""
+date: "19/04/2020"
+output:
+    html_document:
+        toc: true
+        toc_float: true
+        number_sections: true
+        theme: united
+        highlight: haddock
+        df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, comment = "", cache = TRUE)
+```
+
+# Loading All Packages
+
+```{r}
+library(stringr)
+library(tidytext)
+library(readr)
+library(dplyr)
+library(ggplot2)
+```
+
+For now, we shall be using these packages. Later, we shall be needing some more packages related to various classification algorithm.
+
+# The Dataset
+
+For this text classification, we shall be using [US Presidential Speeches Dataset](https://github.com/kfogel/presidential-speeches) by [Kary Fogel](https://github.com/kfogel) in his github respository. I have gone ahead and downloaded the repository locally, and then unzipped it.
+
+All the speeches till today `r Sys.time()` is available in his repository, within the data folder, and we are going to analyze this rich dataset.
+
+
+```{r}
+speeches <- list.files('../datasets/presidential-speeches/')
+head(speeches)
+```
+
+As you can see, each filename starts with a date identifying the date when the speech is given. 
+
+Let us read one file to see how it looks like.
+
+```{r}
+tmp <- read_lines('../datasets/presidential-speeches/1789-04-30-first-inaugural-address.txt')
+tmp[1:5]
+```
+
+As you can also see, each speech starts with "President:" followed by the name of the president as first line. Therefore, we can take use of that to make a dataframe containing the speeches, the corresponding president name and the date of the speech.
+
+For the first job of extracting name of the dates, we shall use `substr` function.
+
+```{r}
+speech_dates <- as.Date(substr(speeches, 1, 10))
+```
+
+Now, we create a list as long as the number of speeches, and we use a for loop to fill up that list by reading the text of the speech and with variables like president name and party names for references. Although a for loop is not usually recommended in `R`, but using it here makes it clear of our aim.
+
+
+```{r}
+speech_list <- vector(mode = "list", length = length(speeches))  # create a blank list
+
+for (i in 1:length(speeches)) {
+    tmp <- read_lines(paste0('../datasets/presidential-speeches/', speeches[i]))
+    speech_list[[i]] <- tibble(line = 2:length(tmp), text = tmp[2:length(tmp)])  # we do not take the first line
+    speech_list[[i]]$president <- substring(tmp[1], 12)   # Take it from 12 character onwards
+    speech_list[[i]]$date <- speech_dates[i]
+}
+
+speech_df <- bind_rows(speech_list)  # finally bind all rows of 
+```
+
+Now we can take a look at the data.
+
+```{r}
+speech_df[1:1000, ]   # prints out only first 1000 rows
+```
+
+Since we see there are lots of blank rows we need to remove them. Also, I shall also need the affiliated party names for each of the presidents. For this, I have used the list provided by [Wikipedia](https://en.wikipedia.org/wiki/List_of_presidents_of_the_United_States) and used a bit of web scrapping to build a dataset containing this.
+
+```{r}
+pres_df <- readRDS('../datasets/US-president.Rds')
+pres_df
+```
+
+The next job is to merge this two dataframes.
+
+```{r}
+speech_df <- speech_df %>% filter(text != "") %>%
+    left_join(pres_df[, c(2, 3)], by = c("president" = "president"))
+
+speech_df[1:1000, ]
+```
+
+# Preprocessing
+
+## Cleaning the texts
+
+Here, the first thing to do is to lowercase all the letters, so that we have a consistency in the data.
+
+```{r}
+speech_df <- speech_df %>% mutate(text = str_to_lower(text) )
+```
+
+The very next thing would be to remove all special symbols, punctuations, numbers etc. But before that, since this is a speech data, it would contain the usage of apostrophe.
+
+For example, "n't" needs to be regarded as "not", "'ve" to be regarded as "have" etc. Also, we need to remove the salutations like "mr.", "mrs." etc. Once we replace these specific patterns, we can remove all characters except the alphabetical characters.
+
+```{r}
+# the next thing is processing apostrophe
+patterns <- c(
+    "n't" = " not", 
+    "'ve" = " have", 
+    "'ll" = " will",
+    "'m" = " am",
+    "'re" = " are",
+    "this's" = "this is",
+    "that's" = "that is",
+    "it's" = "it is",
+    "'s" = "",
+    "mr." = "", 
+    "mrs." = "",
+    "ms." = "",
+    "sr." = ""
+)
+
+speech_df <- speech_df %>% 
+    mutate(text = str_replace_all(string = text, pattern = patterns ) ) %>% 
+    mutate(text = str_replace_all(text, pattern = "[^a-zA-Z\\s]", replacement = " ") )
+
+```
+
+
+## Creating Word Tokens and Calculating tf-idf
+
+In this part, we shall split the words in the texts to create a dataframe, where each row corresponds to an appearence of a word in a speech. `unnest_tokens()` function in `tidytext` package helps us to do that.
+
+```{r}
+words_df <- speech_df %>% unnest_tokens(word, text)
+```
+
+Also, there are "stop words" which are most common words like article, prepositions which are extensively used all over English literature. Hence, removing these words would create a meaningful dataset which only contains the words representing the particular nature of the documents.
+
+```{r}
+data("stop_words")
+words_df <- words_df %>% anti_join(stop_words)
+```
+
+Finally, we the term document matrix, as a dataframe. Note that, here each of the speech works like a document, and this is identified by the date of the speech. Then, we calculate tf-idf based on this dataframe.
+
+```{r}
+term_df <- words_df %>% count(word, date)  # create the term document dataframe
+term_df <- term_df %>% bind_tf_idf(word, date, n)
+```
+
+Finally, corresponding to each data, we shall attach the president name and the affiliated party. This would prepare the dataframe for classification analysis.
+
+```{r}
+tmp <- speech_df %>% group_by(date, president, party) %>% summarise()   # create a dataframe with speech date, president, party
+term_df <- term_df %>% left_join(tmp, by = c("date" = "date"))
+
+term_df[1:1000, ]   # the first 1000 rows of the dataframe
+```
+
+While none of the `tf_idf` is 0, the distribution of the `tf_idf` turns out to be as follows,
+
+```{r}
+term_df %>% dplyr::filter(tf_idf < 0.01) %>%
+    ggplot(aes(x = tf_idf)) + geom_histogram(fill = "brown", bins = 2e2)
+```
+
+
+# Classification Analysis
+
+## Creating Training and Testing Sets
+
+Before proceeding with classification analysis, let us first understand what we want to classify. Here, the input is a speech of some US president, and we wish to know whether the president is from Republican party or Democratic party, and we wish to see whether we can find out some particular words which are more important in identifying this classification.
+
+Based on this, we filter out the party to be either "Republican" or "Democratic".
+
+```{r}
+term_df <- term_df %>% dplyr::filter(party %in% c("Republican", "Democratic"))
+```
+
+The speeches corresponding to these two party affiliated presidents comes from the following dates.
+
+```{r}
+speech_dates <- unique(term_df$date)
+length(speech_dates)
+```
+
+Now, we see there are $809$ speeches. We create the training data corresponding to $609$ speeches, which corresponds to about $0.75\%$ of the total number of speeches, and the rest $200$ speeches (about $0.25\%$) are left as testing dataset. We also see that the proportion of speeches coming from both the parties are on balance in both the training and testing set, so that the classification algorithm would not be very biased towards a particular party.
+
+
+```{r}
+set.seed(2020)  # set a seed so that this is reproducible
+trainIndex <- sample(speech_dates, size = 609)
+
+# create training set
+traindata <- term_df %>% filter(date %in% trainIndex)
+traindata %>% group_by(party) %>% summarise(n = length(unique(date)))
+
+# create testing set
+testdata <- term_df %>% filter(! (date %in% trainIndex))
+testdata %>% group_by(party) %>% summarise(n = length(unique(date)))
+```
+
+## Creating Term Document Matrix and Labels
+
+Firstly, we shall create a vector of affiliated party names, indexed by the speech dates. This can be later used to construct labels for the speeches in training and testing set.
+
+```{r}
+party_names <- tmp$party
+names(party_names) <- tmp$date
+```
+
+We need to create the term document matrix. For that, we shall convert the term document dataframe into a sparse matrix using `Matrix` package.
+
+```{r}
+library(Matrix)
+train_doc <- traindata %>% cast_sparse(date, word, n)
+dim(train_doc)
+```
+
+We see that, it contains $30701$ words, and hence it is clear that we need to identify each document with a $30701$ length vector, which constitutes the feature of the speech. It is extremely computationally intensive to work with these many features. We need to perform some dimensionality reduction technique first.
+
+## Using tf-idf based thresholding
+
+To perform a simple dimension reduction technique, we use the following heuristic algorithm.
+
+1. Group the dataframe into two parts, for two parties.
+
+2. Compute average tf-idf for each word, averaged over all speeches, in each group.
+
+3. For each group, find the top 100 words arranged according to tf-idf value in decreasing order.
+
+
+```{r}
+train_red <- traindata %>% 
+    group_by(party, word) %>% 
+    summarise(mean_tf_idf = mean(tf_idf)) %>%
+    group_by(party) %>%
+    arrange(desc(mean_tf_idf)) %>% top_n(100)    # compute the top 100 words having highest mean_tf_idf
+
+# filter both the traindata and testdata to contain only required words
+red_traindata <- traindata %>% filter(word %in% train_red$word)
+red_testdata <- testdata %>% filter(word %in% train_red$word)
+
+```
+
+We note that, there are only $197$ unique words.
+
+```{r}
+length(unique(train_red$word))
+```
+
+Now, using this reduced training and testing dataframe, we compute the new term document matrix from training set, as well as from testing data also. To ensure that all $197$ words appear, we add a dummy document containing all of these $197$ words.
+
+
+```{r}
+red_words <- sort(unique(train_red$word))
+red_traindata <- rbind(red_traindata, tibble(word = red_words, date = NA, n = 0, tf = 0, idf = 0, tf_idf = 0, president = NA, party = NA) )
+
+train_doc <- red_traindata %>% cast_sparse(date, word, n)
+train_doc <- train_doc[!is.na(rownames(train_doc)), red_words]
+dim(train_doc)
+```
+
+We see that there are now $277$ speeches, and $197$ words in the training set. Similarly, in testing set, we have $76$ speeches. 
+```{r}
+red_testdata <- rbind(red_testdata, tibble(word = red_words, date = NA, n = 0, tf = 0, idf = 0, tf_idf = 0, president = NA, party = NA) )
+
+test_doc <- red_testdata %>% cast_sparse(date, word, n)
+test_doc <- test_doc[!is.na(rownames(test_doc)), red_words]
+
+dim(test_doc)
+```
+
+Finally, we create the training and testing labels.
+
+```{r}
+training_labels <- party_names[rownames(train_doc)]
+testing_labels <- party_names[rownames(test_doc)]
+```
+
+To compare the performance of the different classification algorithms, we create an utility function as follows, which prints out a classfication report based on several classfication characteristics.
+
+```{r}
+classification_report <- function(True_labels, Predicted_labels){
+  # Making a function for the classification characteristics for a problem with levels 1 and 0.
+  # Here x and y are two vectors. x is the actual value while y is the vector of predicted values.
+
+  class_table = table(Predicted_labels , True_labels)
+  cat("Classification Matrix is (Row = Predicted, Column = Actual):\n\n")
+  print(class_table)
+  
+  TP <- class_table[1, 1]; FP <- class_table[1, 2]; FN <- class_table[2, 1]; TN <- class_table[2, 2];
+  
+  Accuracy = (TP+TN)/sum(class_table)
+  cat("\n Accuracy : ", Accuracy, "\n")
+  cat("Classification error : ", 1 - Accuracy, "\n\n")
+  
+  preci = c(TP / (TP + FP), TN / (TN+FN) )
+  recall = c( TP / (TP + FN), TN / (TN + FP) )
+  F1 = 2 *(preci*recall)/(preci+recall)
+  
+  class_df <- data.frame(Class = rownames(class_table), Precision = preci, Recall = recall, F1.measure = F1)
+  cat("Classification Report :\n")
+  print(class_df)
+  
+  Pe = (TP+FP)*(TP+FN)/(sum(class_table)^2) + (TN+FP)*(TN+FN)/(sum(class_table)^2)
+  cat("\n Cohen's Kappa: ", (Accuracy - Pe)/(1 - Pe) )
+  
+  }
+```
+
+
+### Performance of Linear Discriminant Analysis
+
+```{r}
+fit.LDA <- MASS::lda(train_doc, factor(training_labels))
+
+# in training set
+preds <- predict(fit.LDA, newdata = train_doc)
+classification_report(training_labels, preds$class)
+
+# in testing set
+preds <- predict(fit.LDA, newdata = test_doc)
+classification_report(testing_labels, preds$class)
+```
+
+
+### Performance of Naive Bayes Classifier
+
+```{r}
+library(e1071)
+fit.NB <- naiveBayes(x = as.matrix(train_doc), y = factor(training_labels))
+
+# in training set
+preds <- predict(fit.NB, newdata = as.matrix(train_doc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.NB, newdata = as.matrix(test_doc))
+classification_report(testing_labels, preds)
+```
+
+
+### Performance of SVM
+
+We first use polynomial Kernels.
+
+```{r}
+fit.SVM.poly <- svm(x = as.matrix(train_doc), y = factor(training_labels), kernel = "polynomial", cost = 3)
+
+# in training set
+preds <- predict(fit.SVM.poly, newdata = as.matrix(train_doc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.poly, newdata = as.matrix(test_doc))
+classification_report(testing_labels, preds)
+```
+
+Next, we use SVM with Gaussian (or radial basis) kernel.
+
+```{r}
+fit.SVM.radial <- svm(x = as.matrix(train_doc), y = factor(training_labels), kernel = "radial", cost = 2)
+
+# in training set
+preds <- predict(fit.SVM.radial, newdata = as.matrix(train_doc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.radial, newdata = as.matrix(test_doc))
+classification_report(testing_labels, preds)
+```
+
+Finally, using Sigmoid kernel.
+
+```{r}
+fit.SVM.sigmoid <- svm(x = as.matrix(train_doc), y = factor(training_labels), kernel = "sigmoid")
+
+# in training set
+preds <- predict(fit.SVM.sigmoid, newdata = as.matrix(train_doc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.sigmoid, newdata = as.matrix(test_doc))
+classification_report(testing_labels, preds)
+```
+
+### Performance of CART
+
+Now, we use Classification And Regression Tree (CART). The fitted decision tree looks as follows.
+
+```{r fig.height = 10, fig.width=10}
+library(rpart)
+library(rpart.plot)
+
+fit.CART <- rpart(LABEL ~ . , data = cbind(as.data.frame(as.matrix(train_doc)), LABEL = factor(training_labels)), 
+                  method = "class", minsplit = 10)
+rpart.plot(fit.CART)
+```
+
+```{r}
+# in training set
+preds <- predict(fit.CART, type = "class")
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.CART, newdata = as.data.frame(as.matrix(test_doc)), type = "class")
+classification_report(testing_labels, preds)
+
+```
+
+### Performance of Random Forest
+
+Finally, we try training Random Forest classifier. Although, since CART did not perform well, it seems that Random Forest will fail too.
+
+```{r}
+library(randomForest)
+fit.rf <- randomForest(x = as.matrix(train_doc), y = factor(training_labels))
+```
+
+Next, we wish to see which of the words it found to be important in discriminating.
+
+```{r}
+varImpPlot(fit.rf, n.var = 15)
+
+# accuracy in training set
+preds <- predict(fit.rf)
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.rf, newdata = as.matrix(test_doc))
+classification_report(testing_labels, preds)
+```
+
+
+## Using Latent Semantic Analysis
+
+```{r echo = FALSE, eval = FALSE}
+# this is just for convenience
+load('../datasets/US_president_ML_parts/train_test.Rdata')
+```
+
+We first convert the train dataset from dataframe to a sparse term document matrix.
+
+```{r}
+train_doc <- traindata %>% cast_sparse(date, word, n)
+```
+
+Now, we perform LSA on this training document term matrix. This would give us a representation; $X \approx U \Sigma V^T$, which is the singular value decomposition. Restricting $\Sigma$ to be a $k\times k$ matrix, which is very low compared to number of documents or number of words. Then, we can create a new representations for each document using; $\hat{d}_i = \Sigma^{-1}V^T d_i$. This new representation becomes the features of the document.
+
+To understand these features with the words, we link it using $\tilde{t}_i = \Sigma^{-1}U^T t_i$. These $\tilde{t}_i$'s are called Pseudo-terms, which are basically some linear combination of the words, possibly referring to different topics. For this, we shall choose $10$ latent topics.
+
+
+```{r}
+n_topic <- 20
+lsa.fit <- svd(train_doc, nu = n_topic, nv = n_topic)  # obtain the SVD decomposition
+```
+
+Before proceeding with the classification, let us see how these $20$ topics are related with the terms. For this, we consider top 10 words with highest magnitude of coefficients in $V$ matrix, corresponding to each topic.
+
+```{r}
+rownames(lsa.fit$v) <- colnames(train_doc)
+
+# just a simple for loop, using with apply
+topic_mat <- apply(abs(lsa.fit$v), 2, function(x) {names(sort(x, decreasing = T)[1:10])} )
+topic_mat <- t(topic_mat)  # transpose it so that row-wise we have topics, and columns are the words
+rownames(topic_mat) <- paste("Topic", 1:n_topic)
+colnames(topic_mat) <- paste("Word", 1:10)
+
+as.data.frame(topic_mat)
+```
+
+
+Now, we apply the required transformation, to obtain the transformed training and testing document matrix.
+
+```{r}
+new_traindoc <- train_doc %*% lsa.fit$v %*% (diag(1 / lsa.fit$d[1:n_topic]))
+
+# we add a dummy document containing all the words from training set
+testdata <- testdata %>% filter(word %in% colnames(train_doc)) %>% 
+  rbind( tibble(word = colnames(train_doc), date = NA, n = 0, tf = 0, idf = 0, tf_idf = 0, president = NA, party = NA) )
+  
+test_doc <- testdata %>% cast_sparse(date, word, n)
+test_doc <- test_doc[-nrow(test_doc), ]   # the last document is dummy one
+ 
+new_testdoc <- test_doc %*% lsa.fit$v %*% (diag(1 / lsa.fit$d[1:n_topic]))
+
+# finally add some column names
+colnames(new_traindoc) <- colnames(new_testdoc) <- paste("Topic", 1:n_topic)
+```
+
+Now, we are ready to apply our classification algorithms once again, when we prepare the training and testing labels for these new set of documents.
+
+```{r}
+training_labels <- party_names[rownames(train_doc)]
+testing_labels <- party_names[rownames(test_doc)]
+```
+
+### Performance of Linear Discriminant Analysis
+
+```{r}
+fit.LDA <- MASS::lda(new_traindoc, factor(training_labels))
+
+# in training set
+preds <- predict(fit.LDA, newdata = new_traindoc)
+classification_report(training_labels, preds$class)
+
+# in testing set
+preds <- predict(fit.LDA, newdata = new_testdoc)
+classification_report(testing_labels, preds$class)
+```
+
+### Performance of Naive Bayes Classifier
+
+```{r}
+fit.NB <- naiveBayes(x = as.matrix(new_traindoc), y = factor(training_labels))
+
+# in training set
+preds <- predict(fit.NB, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.NB, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+
+### Performance of Support Vector Machine
+
+We first use polynomial Kernels.
+
+```{r}
+fit.SVM.poly <- svm(x = as.matrix(new_traindoc), y = factor(training_labels), kernel = "polynomial", degree = 20)
+
+# in training set
+preds <- predict(fit.SVM.poly, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.poly, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+Next, we use SVM with Gaussian (or radial basis) kernel.
+
+```{r}
+fit.SVM.radial <- svm(x = as.matrix(new_traindoc), y = factor(training_labels), kernel = "radial", cost = 2)
+
+# in training set
+preds <- predict(fit.SVM.radial, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.radial, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+Finally, using Sigmoid kernel.
+
+```{r}
+fit.SVM.sigmoid <- svm(x = as.matrix(new_traindoc), y = factor(training_labels), kernel = "sigmoid")
+
+# in training set
+preds <- predict(fit.SVM.sigmoid, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.sigmoid, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+### Performance of CART
+
+Now, we use Classification And Regression Tree (CART). The fitted decision tree looks as follows.
+
+```{r fig.height = 10, fig.width=10}
+fit.CART <- rpart(LABEL ~ . , data = cbind(as.data.frame(as.matrix(new_traindoc)), LABEL = factor(training_labels)), 
+                  method = "class", minsplit = 50)
+rpart.plot(fit.CART)
+```
+
+```{r}
+# in training set
+preds <- predict(fit.CART, type = "class")
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.CART, newdata = as.data.frame(as.matrix(new_testdoc)), type = "class")
+classification_report(testing_labels, preds)
+
+```
+
+### Performance of Random Forest
+
+Finally, we try training Random Forest classifier. Although, since CART did not perform well, it seems that Random Forest will fail too.
+
+```{r}
+fit.rf <- randomForest(x = as.matrix(new_traindoc), y = factor(training_labels))
+
+# accuracy in training set
+preds <- predict(fit.rf)
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.rf, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+## Using Latent Dirichlet Allocation
+
+```{r echo = FALSE, eval = FALSE}
+# this is just for convenience
+load('../datasets/US_president_ML_parts/train_test.Rdata')
+```
+
+
+Now, we shall be using Latent Dirichlet Allocation for topic modelling, which would give us a lower level representation of each documents, in different topics. We shall be using `topicmodels` package in R for this. However, in this case, we are going to convert our document term matrix into the `DocumentTermMatrix` class presented in `tidytext` package.
+
+```{r}
+library(topicmodels)
+train_doc <- traindata %>% cast_dtm(date, word, n)
+```
+
+```{r echo = TRUE, eval = FALSE}
+# set a seed so that the output of the model is predictable
+mod.lda <- LDA(train_doc, k = n_topic, control = list(seed = 1234, verbose = 1))
+```
+
+```{r echo = FALSE, eval = TRUE}
+# LDA takes time, so this is for speeding this up
+mod.lda <- readRDS('../datasets/US_president_ML_parts/LDA_20.Rds')
+```
+
+
+Now, we find out the most important words related to each topics.
+
+```{r fig.width=10, fig.height=10}
+train_topics <- tidy(mod.lda, matrix = "beta")
+train_topics <- train_topics %>% group_by(topic) %>% top_n(10, beta) %>% ungroup() %>% arrange(topic, -beta)
+
+train_topics %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+
+```
+
+
+Now we obtain the posterior probabilities of the topics for each document in the training and testing set, and use these probabilities as our feature for the document.
+
+```{r}
+new_traindoc <- posterior(mod.lda)$topics
+
+# we add a dummy document containing all the words from training set
+testdata <- testdata %>% filter(word %in% colnames(train_doc)) %>% 
+  rbind( tibble(word = colnames(train_doc), date = NA, n = 0, tf = 0, idf = 0, tf_idf = 0, president = NA, party = NA) )
+  
+test_doc <- testdata %>% cast_dtm(date, word, n)
+test_doc <- test_doc[-nrow(test_doc), ]   # the last document is dummy one
+ 
+new_testdoc <- posterior(mod.lda, newdata = test_doc)$topics
+
+# finally add some column names
+colnames(new_traindoc) <- colnames(new_testdoc) <- paste("Topic", 1:n_topic)
+```
+
+Now, we are ready to apply our classification algorithms for one last time.
+
+### Performance of Linear Discriminant Analysis
+
+```{r}
+fit.LDA <- MASS::lda(new_traindoc, factor(training_labels))
+
+# in training set
+preds <- predict(fit.LDA, newdata = new_traindoc)
+classification_report(training_labels, preds$class)
+
+# in testing set
+preds <- predict(fit.LDA, newdata = new_testdoc)
+classification_report(testing_labels, preds$class)
+```
+
+### Performance of Naive Bayes Classifier
+
+```{r}
+fit.NB <- naiveBayes(x = as.matrix(new_traindoc), y = factor(training_labels))
+
+# in training set
+preds <- predict(fit.NB, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.NB, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+
+### Performance of Support Vector Machine
+
+We first use polynomial Kernels.
+
+```{r}
+fit.SVM.poly <- svm(x = as.matrix(new_traindoc), y = factor(training_labels), kernel = "polynomial", degree = 2)
+
+# in training set
+preds <- predict(fit.SVM.poly, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.poly, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+Next, we use SVM with Gaussian (or radial basis) kernel.
+
+```{r}
+fit.SVM.radial <- svm(x = as.matrix(new_traindoc), y = factor(training_labels), kernel = "radial", cost = 4)
+
+# in training set
+preds <- predict(fit.SVM.radial, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.radial, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+Finally, using Sigmoid kernel.
+
+```{r}
+fit.SVM.sigmoid <- svm(x = as.matrix(new_traindoc), y = factor(training_labels), kernel = "sigmoid", cost = 2)
+
+# in training set
+preds <- predict(fit.SVM.sigmoid, newdata = as.matrix(new_traindoc))
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.SVM.sigmoid, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+### Performance of CART
+
+Now, we use Classification And Regression Tree (CART). The fitted decision tree looks as follows.
+
+```{r fig.height = 10, fig.width=10}
+fit.CART <- rpart(LABEL ~ . , data = cbind(as.data.frame(as.matrix(new_traindoc)), LABEL = factor(training_labels)), 
+                  method = "class", minsplit = 100)
+rpart.plot(fit.CART)
+```
+
+```{r}
+# in training set
+preds <- predict(fit.CART, type = "class")
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.CART, newdata = as.data.frame(as.matrix(new_testdoc)), type = "class")
+classification_report(testing_labels, preds)
+
+```
+
+### Performance of Random Forest
+
+Finally, we try training Random Forest classifier. Although, since CART did not perform well, it seems that Random Forest will fail too.
+
+```{r}
+fit.rf <- randomForest(x = as.matrix(new_traindoc), y = factor(training_labels))
+
+# accuracy in training set
+preds <- predict(fit.rf)
+classification_report(training_labels, preds)
+
+# in testing set
+preds <- predict(fit.rf, newdata = as.matrix(new_testdoc))
+classification_report(testing_labels, preds)
+```
+
+
+# Conclusion
+
+From the above empirical analysis, we can derive the following conclusions.
+
+1. The best performing classification rule is obtained using a Support Vector Machine with radial or gaussian basis kernel, in which case, the data has been preprocessed by Latent Dirichlet Allocation.
+
+2. In general, LSA and LDA dimensional reduction techniques make it easier for classification algorithms to run more smoothly and create better results.
+
+3. Based on the latent topics obtained by LSA and LDA, the topics seemed to related towards the following:
+
+    a. Addressing peace and unity, government treaties and foreign relations.
+    
+    b. Addressing issues like government, public relations, service, law and various reports.
+    
+    c. Adressing bank, money, currency, treasury and economic situations.
+    
+    d. Addressing issues like Soviet and Vietnam war.
+  
+4. Since the best performing classification rule is only $70\%$ accurate, which is not very satisfactory, it seems that it could really be difficult to classify the US presidents based on their speeches, to assign their philosophies into a republican or democratic ones. The topics in which Republican and Democratics generally disagree, they are obtained using the topic modelling to some great extent.
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,297 @@
+---
+title: "Changepoint Analysis of Linguistics in R"
+author: ""
+output:
+    html_document:
+        toc: true
+        toc_float: true
+        number_sections: true
+        theme: united
+        highlight: haddock
+        df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, comment = "")
+```
+
+# Loading All Packages
+
+```{r}
+library(stringr)
+library(tidytext)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+```
+
+
+# The Dataset
+
+Similar to the [work](https://subroy13.github.io/NLPinR/Reports/chapter2.html) before, we shall be using [US Presidential Speeches Dataset](https://github.com/kfogel/presidential-speeches) by [Kary Fogel](https://github.com/kfogel) in his github respository. I have gone ahead and downloaded the repository locally, and then unzipped it.
+
+All the speeches till today `r Sys.time()` is available in his repository, within the data folder, and we are going to analyze this rich dataset.
+
+
+```{r}
+speeches <- list.files('../datasets/presidential-speeches/')
+head(speeches)
+```
+
+
+Now, as we have seen before, the first inaugural address by George Washington in 1789, contains a lot of old english of Victorian age, which almost no people uses Nowadays. Therefore, if we wish to analyze the whole span of presidency at once, we shall be in a lot of trouble (as you have seen the classifiers perform bad) as there will be different words with very similar meanings, one possibly being an evoluted version of another.
+
+Therefore, it is better to split up the whole timespan into different time period, over which the linguistic characteristics changes. To achieve this goal of detecting this points of change in linguistic characteristics, we use Changepoint Detection Analysis.
+
+# Term Frequency as a time series
+
+First, we shall load our cleaned dataset containing the speeches of each president as we obtained in our previous post.
+
+```{r}
+speech_df <- readRDS('../datasets/US-president-speech.Rds')
+speech_df[1:100, ]
+```
+
+The next thing would be to split them into words. However, we `Stemming` and `Lemmatizing`. For example, consider the word `apple` and `apples`. Both means the same word, but if we simply split the texts based on these speeches, these two words might appear. Therefore, we need a method to convert each of the word into their basic forms, so that we do not have unnecessary different forms of the words.
+
+1. **Stemming** is heuristic way to convert each word to their base form, by removing `-ing`, `-er`, `-s` etc. from the end of a word. Hence, it is not always greatly satisfying, however, it is very fast.
+
+2. **Lemmatizing**, on the other hand is a methodical and grammatical way to convert each word to their base form, by carefully mapping them to an existing dictionary, which is created through the understanding of parts of speeches of the words. It has a great performance, at the cost of taking more time to compute.
+
+We are going to use `textstem` library for computing this lemmatization.
+
+
+```{r}
+lemma_text <- textstem::lemmatize_strings(speech_df$text)   # perform lemmatization
+speech_df$text <- lemma_text 
+```
+
+However, it is possible that the word "five" is converted into "5", and since we do not want to deal with numbers as a word, we would like to remove them.
+
+Then, we split the speeches into words, and then compute term document frequency, considering all speeches of a president as a single document.
+
+```{r}
+term_df <- speech_df %>%
+  mutate(text = str_replace_all(text, pattern = "[^a-zA-Z\\s]", replacement = " ") ) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  count(president, word, sort = TRUE)
+
+dim(term_df)
+
+term_df[1:100, ]
+```
+
+Since different words are not comparable with their respective counts, for example, the word "people" would appear a lot often than the word "facebook" in the speeches. So, we need to divide these term frequencies by the word's respective total counts to convert it into some sort of ratio.
+
+```{r}
+term_df <- term_df %>% 
+  left_join(term_df %>% group_by(word) %>% summarise(total = sum(n)), by = "word") %>%
+  mutate(tf = n / total) %>%
+  select(president, word, tf)
+
+```
+
+
+
+To make a time series over all the time span of US presidency, we require to add rows to the above dataframe containing every combination of all existing words and all presidents. For this, we shall use the `pres_df` dataframe from our previous post.
+
+
+```{r}
+all_words <- unique(term_df$word)
+pres_df <- readRDS('../datasets/US-president.Rds')
+
+term_df <- term_df %>%
+  full_join(expand.grid(president = pres_df$president, word = all_words), by = c("president", "word")) %>%
+  replace_na(list(tf = 0)) %>%
+  left_join(pres_df, by = "president")
+
+dim(term_df)
+```
+
+Now as you see, the `term_df` is quite large in size. Each of the time series can now be extracted easily from this dataframe.
+
+For example, let us see how the following words evolved over time.
+
+1. Privateer.
+
+2. Space.
+
+3. Terrorism.
+
+4. Slave
+
+5. War.
+
+6. Money.
+
+7. Treaty.
+
+8. Recession.
+
+9. Nuclear.
+
+
+```{r fig.height=6, fig.width=9}
+check_words <- c("privateer", "space", "terrorism", "slave", "war", "money", "treaty", "recession", "nuclear")
+
+p <- ggplot(term_df %>% dplyr::filter(word %in% check_words), aes(x = date)) +
+  geom_line(aes(y = tf)) +
+  geom_point(aes(y = tf, color = party)) +
+  facet_wrap(~ word) +
+  theme_bw() +
+  ylim(-0.1, 0.4) +
+  xlab("")
+
+ggplotly(p)
+
+```
+
+
+There are some interesting patterns.
+
+1. There are some words like "war", "treaty" which does not evolve much over time.
+
+2. There are some words like "privateer", "slave" which were mostly addressed during 1850-1900s.
+
+3. There are some words like "space", "nuclear", "terrorism" etc. which were mostly addressed in last 70 years, from 1950 onwards.
+
+4. It is surprising the the word "nuclear" shows its first peak at 1961, but not in 1945 or within 1950s, when the atomic bombing on Hiroshima and Nagasaki happened. 
+
+
+# Mean Shift Detection (CUSUM Algorithm)
+
+Now that we have the frequencies of all the words, when the distribution of words changes, and also when the vocabularies changes to detect the linguistic shifts or changepoints. A very simple algorithm is to consider mean shifts.
+
+Let, $y_1, y_2, \dots y_T$ be a time series, then the mean shift based on CUSUM (CUmulative SUM) at time $t$ is simply given by the difference of the averages of precedent and proceeding part of the time series.
+
+$$MS_t = \frac{1}{T-t}\sum_{i=(t+1)}^{T} y_i - \frac{1}{t}\sum_{i=1}^{t} y_i$$
+However, here we tweak this formula a bit to incorporate only local level changes, for instance, we consider a window length of $w$, and consider only observations from $(t-w+1)$ to $(t+w)$ for computation of the means.
+
+Therefore, here we take;
+
+$$MS_t = \left\vert \frac{1}{w}\sum_{i=(t-w+1)}^{t} y_i - \frac{1}{w}\sum_{i=(t+1)}^{(t+w)} y_i \right\vert$$
+
+To compute this easily, we consider a matrix with rows as the words, and each column being the dates of the presidency.
+
+```{r}
+term_mat <- term_df %>% cast_sparse(word, date, tf)
+
+# order the columns in order of time
+term_mat <- term_mat[, sort(colnames(term_mat))]
+```
+
+Now, we write a function that computes this $MS_t$ series and then apply it to every row of the `term_mat` matrix. However, before that, we need to standardized each series,
+
+$$y^\ast_w(t) = \frac{y_w(t) - \bar{y}_w}{s_w}$$
+
+where $y_w(t)$ is the frequency of the word $w$ at time $t$, and $\bar{y}_w$ and $s_w$ are respectively the mean and standard deviation of those time series of frequency.
+
+
+```{r}
+# ms function
+ms <- function(x, w = 3) {
+  # w = window length
+  x <- (x - mean(x, na.rm = T))/sd(x, na.rm = T)   # standardize x, the series
+  pre <- stats::filter(x, rep(1/w, w), sides = 1)
+  post <- lead(rev(stats::filter(rev(x), rep(1/w, w), sides = 1)))
+
+  return(abs(pre - post))
+}
+
+ms_mat <- apply(term_mat, 1, FUN = ms)
+ms_mat <- t(ms_mat)
+colnames(ms_mat) <- colnames(term_mat)
+
+dim(ms_mat)
+```
+
+Now, since the window length is chosen to be 3, the first 2 columns and last 3 columns of the MS matrix will be `NA` values, hence we can simply remove them to free up some spaces.
+
+```{r}
+ms_mat <- ms_mat[, -c(1:2, (dim(ms_mat)[2]-2):dim(ms_mat)[2] )]
+dim(ms_mat)
+```
+
+Now for each of the words, we can extract the plots of the mean shift series.
+
+```{r}
+tmp <- as_tibble(ms_mat, rownames = "word") %>%
+  pivot_longer(-word, names_to = "date", values_to = "ms") %>%
+  mutate(date = as.Date(date))
+
+check_words <- c("space", "war", "america", "vicissitude", "slave", "business", "environment")
+
+p <- ggplot(tmp %>% dplyr::filter(word %in% check_words), aes(x = date)) +
+  geom_line(aes(y = ms, color = word)) +
+  theme_bw()
+
+ggplotly(p)
+```
+
+
+For each word, the estimate of the changepoints can now be readily extracted from the date where maximum for each mean shift series occurs. Also, since each of the series is normalized, we can use a quantile $z_{1-\alpha}$, to check whether that maximum value indeed is significant. In this regard, we assume a gaussian distribution and only take the changepoints which has mean shift higher than $1.96$, corresponding to a $5\%$ level of significance (of both sides, as we are considering change in absolute value).
+
+
+```{r}
+cp <- apply(ms_mat, 1, FUN = function(x) {
+  if (max(x) < qnorm(0.975)) {
+    return(NA)
+  }
+  else {
+    which.max(x)
+  }
+})
+
+head(cp, 25)
+```
+
+Now, we see an histogram of these changepoints, to understand where most of these changepoints actually cluster up.
+
+```{r}
+p <- ggplot(as_tibble(cp) %>% drop_na(), aes(x = value)) + 
+  geom_histogram(aes(y = ..density..), binwidth = 1, fill = "blue", color = "black", alpha = 0.25) + 
+  geom_density(fill = "red", alpha = 0.2, linetype = "dashed", color = "red") +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 20)) +
+  theme_bw()
+
+ggplotly(p)
+```
+
+
+# Conclusion
+
+We kind of see that there are 5 segments where the linguistic shifts occur, namely the 5 peaks of the kernel density estimate of the changepoints. However, the first peak is very close to the starting point, which is possibly a misleading peak due to truncation errors.
+
+The most prominent peaks correspond to the index 12, 20, 31 and finally 38. Next, we extract the corresponding timelines as well as the president's name.
+
+```{r}
+cp_clust <- as.Date(colnames(ms_mat)[c(12, 20, 31, 38)])
+pres_df %>% inner_join(tibble(date = cp_clust), by = "date")
+```
+
+So, we finally see that there are 4 era of linguistic patterns in US president's speech, as follows:
+
+1. George Washington (1789) - Millard Fillmore (1853), signifying possibly the end of Whig party and establishment of the ideals related to Democratic and Republican thoughts.
+
+2. Franklin Pierce (1853) - Chester A. Arthur (1885), ending the depression of finance market throughout 1882-85.
+
+3. Grover Cleveland (1885) - Franklin D. Roosevelt (1945), signifying possibly the end of World War 2.
+
+4. Harry S. Truman (1945) - Jimmy Carter (1981), signifying possibly the end of Vietnamese war and enhancement of global relations.
+
+5. Ronald Reagan (1981) - Donald Trump (present)
+
+
+
+
+
+
+
+
+
+
